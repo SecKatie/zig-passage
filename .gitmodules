@@ -2,3 +2,6 @@
 	path = libs/zxing-cpp
 	url = https://github.com/SecKatie/zxing-cpp.git
 	branch = zig-bindings
+[submodule "libs/age-ffi"]
+	path = libs/age-ffi
+	url = https://github.com/SecKatie/age-ffi.git

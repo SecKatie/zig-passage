@@ -17,6 +17,11 @@ pub fn build(b: *std.Build) void { // You must name your build function build.
     // Add zig-clap dependency for CLI parsing
     const clap = b.dependency("clap", .{});
 
+    // Create age module from the age-ffi Zig bindings
+    const age_mod = b.addModule("age", .{
+        .root_source_file = b.path("libs/age-ffi/zig/age.zig"),
+    });
+
     // Build zxing-cpp from source using CMake with Zig as C++ compiler
     const cmake_build_dir = "libs/zxing-cpp/wrappers/zig/zig-out/cmake-build";
     const cmake_configure = b.addSystemCommand(&.{
@@ -72,6 +77,7 @@ pub fn build(b: *std.Build) void { // You must name your build function build.
                 .{ .name = "zxing", .module = zxing_mod },
                 .{ .name = "clap", .module = clap.module("clap") },
                 .{ .name = "build_options", .module = options.createModule() },
+                .{ .name = "age", .module = age_mod },
             },
         }),
     });
@@ -119,6 +125,7 @@ pub fn build(b: *std.Build) void { // You must name your build function build.
             .imports = &.{
                 .{ .name = "zxing", .module = zxing_mod },
                 .{ .name = "clap", .module = clap.module("clap") },
+                .{ .name = "age", .module = age_mod },
             },
         }),
     });

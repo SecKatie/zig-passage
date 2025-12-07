@@ -1,154 +1,86 @@
 const std = @import("std");
 const fs = std.fs;
 
+// Import the new age-ffi bindings
+const age_lib = @import("age");
+
 // =============================================================================
-// AGE ENCRYPTION MODULE
+// AGE ENCRYPTION MODULE - Compatibility Wrapper
 // =============================================================================
 //
-// This module provides age encryption/decryption via FFI bindings to the
-// Rust `age` crate. This replaces the previous shell-based implementation
-// for better performance and reliability.
+// This module provides backward-compatible wrappers around the new age-ffi
+// Zig bindings, maintaining the same API that the rest of the codebase uses.
 // =============================================================================
 
-// FFI bindings to libage_ffi (Rust)
-const c = struct {
-    const AgeResult = enum(c_int) {
-        Success = 0,
-        InvalidInput = 1,
-        EncryptionFailed = 2,
-        DecryptionFailed = 3,
-        KeygenFailed = 4,
-        IoError = 5,
-        InvalidRecipient = 6,
-        InvalidIdentity = 7,
-    };
-
-    const AgeKeypair = extern struct {
-        public_key: ?[*:0]u8,
-        private_key: ?[*:0]u8,
-    };
-
-    extern fn age_decrypt_file(
-        encrypted_path: [*:0]const u8,
-        identity_path: [*:0]const u8,
-        output: *?[*:0]u8,
-        output_len: *usize,
-    ) AgeResult;
-
-    extern fn age_encrypt_to_file(
-        plaintext: [*]const u8,
-        plaintext_len: usize,
-        output_path: [*:0]const u8,
-        recipient: [*:0]const u8,
-    ) AgeResult;
-
-    extern fn age_generate_keypair(keypair: *AgeKeypair) AgeResult;
-
-    extern fn age_free_string(s: ?[*:0]u8) void;
-    extern fn age_free_keypair(keypair: *AgeKeypair) void;
-};
-
-pub const AgeError = error{
-    DecryptionFailed,
-    EncryptionFailed,
-    KeygenFailed,
-    InvalidInput,
-    IoError,
-    InvalidRecipient,
-    InvalidIdentity,
-};
-
-/// Convert C AgeResult to Zig error
-fn resultToError(result: c.AgeResult) AgeError!void {
-    return switch (result) {
-        .Success => {},
-        .InvalidInput => AgeError.InvalidInput,
-        .EncryptionFailed => AgeError.EncryptionFailed,
-        .DecryptionFailed => AgeError.DecryptionFailed,
-        .KeygenFailed => AgeError.KeygenFailed,
-        .IoError => AgeError.IoError,
-        .InvalidRecipient => AgeError.InvalidRecipient,
-        .InvalidIdentity => AgeError.InvalidIdentity,
-    };
-}
+// Re-export error types
+pub const AgeError = age_lib.AgeError;
 
 /// Decrypt an age-encrypted file using the identity file
+/// Returns allocated memory that the caller must free
 pub fn decrypt(allocator: std.mem.Allocator, encrypted_path: []const u8, identity_file: []const u8) ![]const u8 {
-    // Convert paths to null-terminated strings
+    // Convert to null-terminated strings
     const encrypted_path_z = try allocator.dupeZ(u8, encrypted_path);
     defer allocator.free(encrypted_path_z);
 
     const identity_file_z = try allocator.dupeZ(u8, identity_file);
     defer allocator.free(identity_file_z);
 
-    var output: ?[*:0]u8 = null;
-    var output_len: usize = 0;
+    // Use the new API
+    var buffer = try age_lib.decryptFile(encrypted_path_z, identity_file_z);
+    defer buffer.deinit();
 
-    const result = c.age_decrypt_file(
-        encrypted_path_z.ptr,
-        identity_file_z.ptr,
-        &output,
-        &output_len,
-    );
-
-    try resultToError(result);
-
-    if (output) |ptr| {
-        // Copy the data to a Zig-managed slice
-        const data = try allocator.dupe(u8, ptr[0..output_len]);
-        // Free the Rust-allocated string
-        c.age_free_string(ptr);
-        return data;
-    }
-
-    return AgeError.DecryptionFailed;
+    // Convert to owned slice (the caller will free this)
+    return try allocator.dupe(u8, buffer.toSlice());
 }
 
 /// Encrypt content to a file using recipients
+/// The recipients parameter can be either:
+/// - A path to a file containing recipient public keys (one per line)
+/// - A direct recipient public key string
 pub fn encrypt(allocator: std.mem.Allocator, content: []const u8, output_path: []const u8, recipients: []const u8) !void {
-    // Convert paths to null-terminated strings
     const output_path_z = try allocator.dupeZ(u8, output_path);
     defer allocator.free(output_path_z);
 
-    const recipients_z = try allocator.dupeZ(u8, recipients);
-    defer allocator.free(recipients_z);
+    // Check if recipients is a file path or a direct key
+    // If it starts with "age1" it's likely a direct key, otherwise try to read it as a file
+    const is_direct_key = std.mem.startsWith(u8, recipients, "age1");
 
-    const result = c.age_encrypt_to_file(
-        content.ptr,
-        content.len,
-        output_path_z.ptr,
-        recipients_z.ptr,
-    );
+    if (is_direct_key) {
+        // Direct recipient key
+        const recipients_z = try allocator.dupeZ(u8, recipients);
+        defer allocator.free(recipients_z);
 
-    try resultToError(result);
+        try age_lib.encryptToFile(content, recipients_z, output_path_z);
+    } else {
+        // Assume it's a file path, read the first recipient from it
+        const file = try fs.openFileAbsolute(recipients, .{});
+        defer file.close();
+
+        const file_content = try file.readToEndAlloc(allocator, 1024 * 1024); // 1MB max
+        defer allocator.free(file_content);
+
+        // Get the first line (first recipient)
+        var lines = std.mem.tokenizeScalar(u8, file_content, '\n');
+        const first_line = lines.next() orelse return error.NoRecipients;
+
+        // Trim whitespace
+        const recipient = std.mem.trim(u8, first_line, " \t\r");
+
+        const recipient_z = try allocator.dupeZ(u8, recipient);
+        defer allocator.free(recipient_z);
+
+        try age_lib.encryptToFile(content, recipient_z, output_path_z);
+    }
 }
 
 /// Generate a new age keypair
 pub fn generateKeypair(allocator: std.mem.Allocator) !struct { public_key: []const u8, private_key: []const u8 } {
-    var keypair: c.AgeKeypair = .{
-        .public_key = null,
-        .private_key = null,
-    };
+    var keypair = try age_lib.generateKeypair();
+    defer keypair.deinit();
 
-    const result = c.age_generate_keypair(&keypair);
-    try resultToError(result);
-
-    // Copy strings to Zig-managed memory
-    const public_key = if (keypair.public_key) |pk| blk: {
-        const len = std.mem.len(pk);
-        break :blk try allocator.dupe(u8, pk[0..len]);
-    } else return AgeError.KeygenFailed;
-
-    const private_key = if (keypair.private_key) |sk| blk: {
-        const len = std.mem.len(sk);
-        break :blk try allocator.dupe(u8, sk[0..len]);
-    } else {
-        allocator.free(public_key);
-        return AgeError.KeygenFailed;
-    };
-
-    // Free Rust-allocated memory
-    c.age_free_keypair(&keypair);
+    // Copy to allocator-owned memory
+    const public_key = try allocator.dupe(u8, keypair.getPublicKey());
+    const private_key = try allocator.dupe(u8, keypair.getPrivateKey());
 
     return .{
         .public_key = public_key,
@@ -194,19 +126,12 @@ test "encrypt and decrypt roundtrip" {
     try id_file.writeAll(keypair.private_key);
     id_file.close();
 
-    // Write recipients file with public key
-    const recipients_path = tmp_dir ++ "/recipients";
-    const rec_file = try fs.createFileAbsolute(recipients_path, .{});
-    try rec_file.writeAll(keypair.public_key);
-    try rec_file.writeAll("\n");
-    rec_file.close();
-
     // Test content
     const original = "Hello, this is a secret message!";
     const encrypted_path = tmp_dir ++ "/encrypted.age";
 
-    // Encrypt
-    try encrypt(allocator, original, encrypted_path, recipients_path);
+    // Encrypt using direct public key
+    try encrypt(allocator, original, encrypted_path, keypair.public_key);
 
     // Verify encrypted file exists
     try fs.accessAbsolute(encrypted_path, .{});
@@ -219,11 +144,11 @@ test "encrypt and decrypt roundtrip" {
     try std.testing.expectEqualStrings(original, decrypted);
 }
 
-test "encrypt with direct recipient key" {
+test "encrypt with recipients file" {
     const allocator = std.testing.allocator;
 
     // Create temp directory for test
-    const tmp_dir = "/tmp/passage-age-test-direct";
+    const tmp_dir = "/tmp/passage-age-test-file";
     fs.deleteTreeAbsolute(tmp_dir) catch {};
     try fs.makeDirAbsolute(tmp_dir);
     defer fs.deleteTreeAbsolute(tmp_dir) catch {};
@@ -239,12 +164,19 @@ test "encrypt with direct recipient key" {
     try id_file.writeAll(keypair.private_key);
     id_file.close();
 
+    // Write recipients file with public key
+    const recipients_path = tmp_dir ++ "/recipients";
+    const rec_file = try fs.createFileAbsolute(recipients_path, .{});
+    try rec_file.writeAll(keypair.public_key);
+    try rec_file.writeAll("\n");
+    rec_file.close();
+
     // Test content
-    const original = "Direct recipient encryption test!";
+    const original = "Recipients file encryption test!";
     const encrypted_path = tmp_dir ++ "/encrypted.age";
 
-    // Encrypt using direct public key (not a file)
-    try encrypt(allocator, original, encrypted_path, keypair.public_key);
+    // Encrypt using recipients file path
+    try encrypt(allocator, original, encrypted_path, recipients_path);
 
     // Decrypt
     const decrypted = try decrypt(allocator, encrypted_path, identity_path);
