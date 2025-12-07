@@ -42,6 +42,15 @@ pub fn build(b: *std.Build) void { // You must name your build function build.
     });
     cmake_build.step.dependOn(&cmake_configure.step);
 
+    // Build age-ffi Rust library using Cargo
+    const cargo_build = b.addSystemCommand(&.{
+        "cargo",
+        "build",
+        "--release",
+        "--manifest-path",
+        "libs/age-ffi/Cargo.toml",
+    });
+
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -69,6 +78,16 @@ pub fn build(b: *std.Build) void { // You must name your build function build.
     }
     exe.linkLibC();
     exe.step.dependOn(&cmake_build.step);
+
+    // Configure age-ffi Rust library
+    exe.addLibraryPath(b.path("libs/age-ffi/target/release"));
+    exe.addObjectFile(b.path("libs/age-ffi/target/release/libage_ffi.a"));
+    if (target.result.os.tag == .macos) {
+        // macOS requires Security and CoreFoundation frameworks for Rust crypto
+        exe.linkFramework("Security");
+        exe.linkFramework("CoreFoundation");
+    }
+    exe.step.dependOn(&cargo_build.step);
 
     // This makes `zig build` produce the binary
     b.installArtifact(exe);
@@ -106,6 +125,15 @@ pub fn build(b: *std.Build) void { // You must name your build function build.
     }
     unit_tests.linkLibC();
     unit_tests.step.dependOn(&cmake_build.step);
+
+    // Configure age-ffi for tests
+    unit_tests.addLibraryPath(b.path("libs/age-ffi/target/release"));
+    unit_tests.addObjectFile(b.path("libs/age-ffi/target/release/libage_ffi.a"));
+    if (target.result.os.tag == .macos) {
+        unit_tests.linkFramework("Security");
+        unit_tests.linkFramework("CoreFoundation");
+    }
+    unit_tests.step.dependOn(&cargo_build.step);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");

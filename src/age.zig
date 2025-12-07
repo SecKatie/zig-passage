@@ -1,144 +1,154 @@
 const std = @import("std");
 const fs = std.fs;
-const process = std.process;
 
 // =============================================================================
 // AGE ENCRYPTION MODULE
 // =============================================================================
 //
-// This module wraps the `age` command-line tool for encryption/decryption.
-// Unlike the bash version which uses pipes, we use temp files for simplicity.
-//
-// In the future, you could link directly to libsodium for native encryption,
-// but calling the age binary maintains compatibility with existing stores.
+// This module provides age encryption/decryption via FFI bindings to the
+// Rust `age` crate. This replaces the previous shell-based implementation
+// for better performance and reliability.
 // =============================================================================
+
+// FFI bindings to libage_ffi (Rust)
+const c = struct {
+    const AgeResult = enum(c_int) {
+        Success = 0,
+        InvalidInput = 1,
+        EncryptionFailed = 2,
+        DecryptionFailed = 3,
+        KeygenFailed = 4,
+        IoError = 5,
+        InvalidRecipient = 6,
+        InvalidIdentity = 7,
+    };
+
+    const AgeKeypair = extern struct {
+        public_key: ?[*:0]u8,
+        private_key: ?[*:0]u8,
+    };
+
+    extern fn age_decrypt_file(
+        encrypted_path: [*:0]const u8,
+        identity_path: [*:0]const u8,
+        output: *?[*:0]u8,
+        output_len: *usize,
+    ) AgeResult;
+
+    extern fn age_encrypt_to_file(
+        plaintext: [*]const u8,
+        plaintext_len: usize,
+        output_path: [*:0]const u8,
+        recipient: [*:0]const u8,
+    ) AgeResult;
+
+    extern fn age_generate_keypair(keypair: *AgeKeypair) AgeResult;
+
+    extern fn age_free_string(s: ?[*:0]u8) void;
+    extern fn age_free_keypair(keypair: *AgeKeypair) void;
+};
 
 pub const AgeError = error{
     DecryptionFailed,
     EncryptionFailed,
-    AgeBinaryNotFound,
-    InvalidRecipients,
+    KeygenFailed,
+    InvalidInput,
+    IoError,
+    InvalidRecipient,
+    InvalidIdentity,
 };
+
+/// Convert C AgeResult to Zig error
+fn resultToError(result: c.AgeResult) AgeError!void {
+    return switch (result) {
+        .Success => {},
+        .InvalidInput => AgeError.InvalidInput,
+        .EncryptionFailed => AgeError.EncryptionFailed,
+        .DecryptionFailed => AgeError.DecryptionFailed,
+        .KeygenFailed => AgeError.KeygenFailed,
+        .IoError => AgeError.IoError,
+        .InvalidRecipient => AgeError.InvalidRecipient,
+        .InvalidIdentity => AgeError.InvalidIdentity,
+    };
+}
 
 /// Decrypt an age-encrypted file using the identity file
 pub fn decrypt(allocator: std.mem.Allocator, encrypted_path: []const u8, identity_file: []const u8) ![]const u8 {
-    // Find age binary
-    const age_bin = std.posix.getenv("PASSAGE_AGE") orelse "age";
+    // Convert paths to null-terminated strings
+    const encrypted_path_z = try allocator.dupeZ(u8, encrypted_path);
+    defer allocator.free(encrypted_path_z);
 
-    // Build command: age -d -i identity_file encrypted_path
-    const argv = [_][]const u8{ age_bin, "-d", "-i", identity_file, encrypted_path };
+    const identity_file_z = try allocator.dupeZ(u8, identity_file);
+    defer allocator.free(identity_file_z);
 
-    // Spawn child process and capture output
-    var child = std.process.Child.init(&argv, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
+    var output: ?[*:0]u8 = null;
+    var output_len: usize = 0;
 
-    try child.spawn();
+    const result = c.age_decrypt_file(
+        encrypted_path_z.ptr,
+        identity_file_z.ptr,
+        &output,
+        &output_len,
+    );
 
-    // Read stdout (the decrypted content)
-    const stdout = child.stdout.?;
-    var read_buf: [4096]u8 = undefined;
-    var f_reader = stdout.reader(&read_buf);
-    const output = try f_reader.interface.allocRemaining(allocator, .unlimited);
+    try resultToError(result);
 
-    const result = child.wait() catch return AgeError.DecryptionFailed;
-
-    if (result.Exited != 0) {
-        allocator.free(output);
-        return AgeError.DecryptionFailed;
+    if (output) |ptr| {
+        // Copy the data to a Zig-managed slice
+        const data = try allocator.dupe(u8, ptr[0..output_len]);
+        // Free the Rust-allocated string
+        c.age_free_string(ptr);
+        return data;
     }
 
-    return output;
+    return AgeError.DecryptionFailed;
 }
 
 /// Encrypt content to a file using recipients
 pub fn encrypt(allocator: std.mem.Allocator, content: []const u8, output_path: []const u8, recipients: []const u8) !void {
-    const age_bin = std.posix.getenv("PASSAGE_AGE") orelse "age";
+    // Convert paths to null-terminated strings
+    const output_path_z = try allocator.dupeZ(u8, output_path);
+    defer allocator.free(output_path_z);
 
-    // Determine if recipients is a file or a raw recipient
-    const is_file = std.fs.path.isAbsolute(recipients) or std.mem.startsWith(u8, recipients, ".");
+    const recipients_z = try allocator.dupeZ(u8, recipients);
+    defer allocator.free(recipients_z);
 
-    // Build command
-    var argv_list: std.ArrayList([]const u8) = .empty;
-    defer argv_list.deinit(allocator);
+    const result = c.age_encrypt_to_file(
+        content.ptr,
+        content.len,
+        output_path_z.ptr,
+        recipients_z.ptr,
+    );
 
-    try argv_list.append(allocator, age_bin);
-    try argv_list.append(allocator, "-e");
-
-    if (is_file) {
-        try argv_list.append(allocator, "-R");
-    } else {
-        try argv_list.append(allocator, "-r");
-    }
-    try argv_list.append(allocator, recipients);
-
-    try argv_list.append(allocator, "-o");
-    try argv_list.append(allocator, output_path);
-
-    var child = std.process.Child.init(argv_list.items, allocator);
-    child.stdin_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    try child.spawn();
-
-    // Write content to stdin
-    const stdin = child.stdin.?;
-    try stdin.writeAll(content);
-    stdin.close();
-    child.stdin = null;
-
-    const result = child.wait() catch return AgeError.EncryptionFailed;
-
-    if (result.Exited != 0) {
-        return AgeError.EncryptionFailed;
-    }
+    try resultToError(result);
 }
 
 /// Generate a new age keypair
 pub fn generateKeypair(allocator: std.mem.Allocator) !struct { public_key: []const u8, private_key: []const u8 } {
-    const age_keygen = std.posix.getenv("PASSAGE_AGE_KEYGEN") orelse "age-keygen";
+    var keypair: c.AgeKeypair = .{
+        .public_key = null,
+        .private_key = null,
+    };
 
-    var child = std.process.Child.init(&.{age_keygen}, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
+    const result = c.age_generate_keypair(&keypair);
+    try resultToError(result);
 
-    try child.spawn();
+    // Copy strings to Zig-managed memory
+    const public_key = if (keypair.public_key) |pk| blk: {
+        const len = std.mem.len(pk);
+        break :blk try allocator.dupe(u8, pk[0..len]);
+    } else return AgeError.KeygenFailed;
 
-    // age-keygen outputs to stdout:
-    // - # created: timestamp
-    // - # public key: age1...
-    // - AGE-SECRET-KEY-...
-    //
-    // And to stderr:
-    // - Public key: age1...
+    const private_key = if (keypair.private_key) |sk| blk: {
+        const len = std.mem.len(sk);
+        break :blk try allocator.dupe(u8, sk[0..len]);
+    } else {
+        allocator.free(public_key);
+        return AgeError.KeygenFailed;
+    };
 
-    const stdout = child.stdout.?;
-    const stderr = child.stderr.?;
-
-    var stdout_buf: [4096]u8 = undefined;
-    var stderr_buf: [4096]u8 = undefined;
-    var stdout_reader = stdout.reader(&stdout_buf);
-    var stderr_reader = stderr.reader(&stderr_buf);
-    const private_key = try stdout_reader.interface.allocRemaining(allocator, .unlimited);
-    const stderr_output = try stderr_reader.interface.allocRemaining(allocator, .unlimited);
-    defer allocator.free(stderr_output);
-
-    const result = try child.wait();
-    if (result.Exited != 0) {
-        allocator.free(private_key);
-        return error.KeygenFailed;
-    }
-
-    // Parse public key from stdout (format: "# public key: age1...")
-    // The full output (private_key) contains the public key as a comment
-    var public_key: []const u8 = "";
-    var lines = std.mem.splitSequence(u8, private_key, "\n");
-    while (lines.next()) |line| {
-        if (std.mem.startsWith(u8, line, "# public key: ")) {
-            public_key = try allocator.dupe(u8, line[14..]);
-            break;
-        }
-    }
+    // Free Rust-allocated memory
+    c.age_free_keypair(&keypair);
 
     return .{
         .public_key = public_key,
@@ -150,43 +160,22 @@ pub fn generateKeypair(allocator: std.mem.Allocator) !struct { public_key: []con
 // TESTS
 // =============================================================================
 
-test "age binary exists" {
-    // This test checks if age is installed (useful for CI)
-    const age_bin = std.posix.getenv("PASSAGE_AGE") orelse "age";
+test "generate keypair" {
+    const allocator = std.testing.allocator;
 
-    var child = std.process.Child.init(&.{ age_bin, "--version" }, std.testing.allocator);
-    child.stdout_behavior = .Pipe;
+    const keypair = try generateKeypair(allocator);
+    defer allocator.free(keypair.public_key);
+    defer allocator.free(keypair.private_key);
 
-    child.spawn() catch {
-        std.debug.print("Warning: age binary not found at '{s}'\n", .{age_bin});
-        return;
-    };
+    // Public key should start with "age1"
+    try std.testing.expect(std.mem.startsWith(u8, keypair.public_key, "age1"));
 
-    _ = try child.wait();
-}
-
-test "age-keygen binary exists" {
-    const age_keygen = std.posix.getenv("PASSAGE_AGE_KEYGEN") orelse "age-keygen";
-
-    var child = std.process.Child.init(&.{ age_keygen, "--version" }, std.testing.allocator);
-    child.stdout_behavior = .Pipe;
-
-    child.spawn() catch {
-        std.debug.print("Warning: age-keygen binary not found at '{s}'\n", .{age_keygen});
-        return;
-    };
-
-    _ = try child.wait();
+    // Private key should start with "AGE-SECRET-KEY-"
+    try std.testing.expect(std.mem.startsWith(u8, keypair.private_key, "AGE-SECRET-KEY-"));
 }
 
 test "encrypt and decrypt roundtrip" {
     const allocator = std.testing.allocator;
-
-    // Skip if age not installed
-    var check_child = std.process.Child.init(&.{ "age", "--version" }, allocator);
-    check_child.stdout_behavior = .Pipe;
-    check_child.spawn() catch return;
-    _ = try check_child.wait();
 
     // Create temp directory for test
     const tmp_dir = "/tmp/passage-age-test";
@@ -195,20 +184,17 @@ test "encrypt and decrypt roundtrip" {
     defer fs.deleteTreeAbsolute(tmp_dir) catch {};
 
     // Generate keypair
-    const keypair = generateKeypair(allocator) catch |err| {
-        std.debug.print("Keygen failed: {}\n", .{err});
-        return;
-    };
+    const keypair = try generateKeypair(allocator);
     defer allocator.free(keypair.public_key);
     defer allocator.free(keypair.private_key);
 
-    // Write identity file (contains the full private key output from age-keygen)
+    // Write identity file (private key only for age library)
     const identity_path = tmp_dir ++ "/identity";
     const id_file = try fs.createFileAbsolute(identity_path, .{});
     try id_file.writeAll(keypair.private_key);
     id_file.close();
 
-    // Write recipients file with public key (just the key, one per line)
+    // Write recipients file with public key
     const recipients_path = tmp_dir ++ "/recipients";
     const rec_file = try fs.createFileAbsolute(recipients_path, .{});
     try rec_file.writeAll(keypair.public_key);
@@ -220,14 +206,45 @@ test "encrypt and decrypt roundtrip" {
     const encrypted_path = tmp_dir ++ "/encrypted.age";
 
     // Encrypt
-    encrypt(allocator, original, encrypted_path, recipients_path) catch |err| {
-        std.debug.print("Encryption failed: {}\n", .{err});
-        std.debug.print("Public key: {s}\n", .{keypair.public_key});
-        return;
-    };
+    try encrypt(allocator, original, encrypted_path, recipients_path);
 
     // Verify encrypted file exists
     try fs.accessAbsolute(encrypted_path, .{});
+
+    // Decrypt
+    const decrypted = try decrypt(allocator, encrypted_path, identity_path);
+    defer allocator.free(decrypted);
+
+    // Verify content matches
+    try std.testing.expectEqualStrings(original, decrypted);
+}
+
+test "encrypt with direct recipient key" {
+    const allocator = std.testing.allocator;
+
+    // Create temp directory for test
+    const tmp_dir = "/tmp/passage-age-test-direct";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    // Generate keypair
+    const keypair = try generateKeypair(allocator);
+    defer allocator.free(keypair.public_key);
+    defer allocator.free(keypair.private_key);
+
+    // Write identity file
+    const identity_path = tmp_dir ++ "/identity";
+    const id_file = try fs.createFileAbsolute(identity_path, .{});
+    try id_file.writeAll(keypair.private_key);
+    id_file.close();
+
+    // Test content
+    const original = "Direct recipient encryption test!";
+    const encrypted_path = tmp_dir ++ "/encrypted.age";
+
+    // Encrypt using direct public key (not a file)
+    try encrypt(allocator, original, encrypted_path, keypair.public_key);
 
     // Decrypt
     const decrypted = try decrypt(allocator, encrypted_path, identity_path);

@@ -1,2 +1,4 @@
 zig-out/
 .zig-cache/
+libs/age-ffi/target/
+libs/age-ffi/Cargo.lock
