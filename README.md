@@ -180,7 +180,7 @@ for file in ~/.password-store/**/*.gpg; do
 done
 ```
 
-## Comparison with passage (Go)
+## Comparison with passage (shell implementation)
 
 This is a Zig reimplementation of [FiloSottile/passage](https://github.com/FiloSottile/passage) with:
 
