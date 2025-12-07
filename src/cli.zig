@@ -1,7 +1,10 @@
 const std = @import("std");
 const clap = @import("clap");
+const build_options = @import("build_options");
 const Store = @import("store.zig").Store;
 const utils = @import("utils.zig");
+
+const version_string = "passage v" ++ build_options.version ++ "-zig\n";
 
 // =============================================================================
 // COMMAND LINE INTERFACE - Using zig-clap
@@ -146,7 +149,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         return;
     }
     if (res.args.version != 0) {
-        try stdout.writeAll("passage v1.7.4-zig\n");
+        try stdout.writeAll(version_string);
         try stdout.flush();
         return;
     }
@@ -164,7 +167,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     // Dispatch to subcommand handlers (each opens store as needed)
     switch (subcmd) {
-        .version => try stdout.writeAll("passage v1.7.4-zig\n"),
+        .version => try stdout.writeAll(version_string),
         .list, .ls => try handleList(allocator, &iter, stdout_file),
         .show => try handleShow(allocator, &iter),
         .insert, .add => try handleInsert(allocator, &iter),

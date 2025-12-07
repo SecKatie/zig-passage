@@ -49,10 +49,6 @@ pub const Store = struct {
         QrCodeFailed,
     };
 
-
-
-
-
     /// Opens an existing password store or prepares for initialization
     pub fn open(allocator: std.mem.Allocator) !Self {
         const home = std.posix.getenv("HOME") orelse return error.HomeNotFound;
@@ -587,8 +583,6 @@ pub const Store = struct {
         try self.gitCommit("{s} password for {s} using {s}", .{ action, name, editor });
     }
 
-
-
     /// Delete a password
     pub fn delete(self: *Self, opts: cli.Command.DeleteOptions) !void {
         try utils.checkSneakyPaths(opts.name);
@@ -952,8 +946,6 @@ pub const Store = struct {
 // =============================================================================
 // TESTS
 // =============================================================================
-
-
 
 // Integration tests require age to be installed and can be run separately
 test "store open and deinit" {

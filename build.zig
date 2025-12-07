@@ -1,9 +1,12 @@
 const std = @import("std");
+const build_zon = @import("build.zig.zon");
 
 // Build files in Zig are themselves Zig code!
 // This is different from Makefiles or package.json - you get full language power.
-
 pub fn build(b: *std.Build) void { // You must name your build function build.
+    // Create build options to pass version to source code
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", build_zon.version);
     // Add zxing-cpp dependency for QR code generation
     const zxing_dep = b.dependency("zxing_cpp", .{});
 
@@ -68,6 +71,7 @@ pub fn build(b: *std.Build) void { // You must name your build function build.
             .imports = &.{
                 .{ .name = "zxing", .module = zxing_mod },
                 .{ .name = "clap", .module = clap.module("clap") },
+                .{ .name = "build_options", .module = options.createModule() },
             },
         }),
     });
