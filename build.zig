@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) void { // You must name your build function build.
     // Add zig-clap dependency for CLI parsing
     const clap = b.dependency("clap", .{});
 
-    // Build zxing-cpp from source using CMake
+    // Build zxing-cpp from source using CMake with Zig as C++ compiler
     const cmake_build_dir = "libs/zxing-cpp/wrappers/zig/zig-out/cmake-build";
     const cmake_configure = b.addSystemCommand(&.{
         "cmake",
@@ -29,8 +29,12 @@ pub fn build(b: *std.Build) void { // You must name your build function build.
         "-DZXING_EXPERIMENTAL_API=ON",
         "-DZXING_C_API=ON",
         "-DZXING_USE_BUNDLED_ZINT=ON",
+        "-DZXING_EXAMPLES=OFF",
         "-DCMAKE_CXX_STANDARD=20",
     });
+    // Use Zig as the C and C++ compiler (eliminates need for separate clang++/g++)
+    cmake_configure.setEnvironmentVariable("CC", "zig cc");
+    cmake_configure.setEnvironmentVariable("CXX", "zig c++");
 
     const cmake_build = b.addSystemCommand(&.{
         "cmake",

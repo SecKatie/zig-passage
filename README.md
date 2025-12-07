@@ -18,7 +18,6 @@ A password manager using [age](https://age-encryption.org/) encryption, written 
 - [Zig](https://ziglang.org/) 0.14.0 or later
 - [Rust](https://rustup.rs/) (for age encryption library)
 - [CMake](https://cmake.org/) (for zxing-cpp)
-- C++ compiler (clang++ or g++)
 
 ### Runtime Dependencies
 
@@ -30,17 +29,12 @@ None! All dependencies are statically linked.
 
 **macOS:**
 ```bash
-# Xcode Command Line Tools (provides C++ compiler and system frameworks)
-xcode-select --install
-
-# Build tools
 brew install zig rust cmake
 ```
 
 **Ubuntu/Debian:**
 ```bash
-# C++ compiler, CMake, and standard library
-sudo apt install cmake build-essential libstdc++-12-dev
+sudo apt install cmake
 
 # Zig - download from https://ziglang.org/download/
 # Or use snap: sudo snap install zig --classic --beta
@@ -51,12 +45,12 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 **Fedora:**
 ```bash
-sudo dnf install cmake gcc-c++ libstdc++-devel zig rust cargo
+sudo dnf install cmake zig rust cargo
 ```
 
 **Arch Linux:**
 ```bash
-sudo pacman -S zig rust cmake base-devel
+sudo pacman -S zig rust cmake
 ```
 
 ### 2. Clone and build
