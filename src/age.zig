@@ -36,41 +36,18 @@ pub fn decrypt(allocator: std.mem.Allocator, encrypted_path: []const u8, identit
 /// Encrypt content to a file using recipients
 /// The recipients parameter can be either:
 /// - A path to a file containing recipient public keys (one per line)
-/// - A direct recipient public key string
+/// - A direct recipient public key string (age1..., ssh-...)
+/// The Rust library handles both cases, including plugin recipients (age1se1..., etc.)
 pub fn encrypt(allocator: std.mem.Allocator, content: []const u8, output_path: []const u8, recipients: []const u8) !void {
     const output_path_z = try allocator.dupeZ(u8, output_path);
     defer allocator.free(output_path_z);
 
-    // Check if recipients is a file path or a direct key
-    // If it starts with "age1" it's likely a direct key, otherwise try to read it as a file
-    const is_direct_key = std.mem.startsWith(u8, recipients, "age1");
+    const recipients_z = try allocator.dupeZ(u8, recipients);
+    defer allocator.free(recipients_z);
 
-    if (is_direct_key) {
-        // Direct recipient key
-        const recipients_z = try allocator.dupeZ(u8, recipients);
-        defer allocator.free(recipients_z);
-
-        try age_lib.encryptToFile(content, recipients_z, output_path_z);
-    } else {
-        // Assume it's a file path, read the first recipient from it
-        const file = try fs.openFileAbsolute(recipients, .{});
-        defer file.close();
-
-        const file_content = try file.readToEndAlloc(allocator, 1024 * 1024); // 1MB max
-        defer allocator.free(file_content);
-
-        // Get the first line (first recipient)
-        var lines = std.mem.tokenizeScalar(u8, file_content, '\n');
-        const first_line = lines.next() orelse return error.NoRecipients;
-
-        // Trim whitespace
-        const recipient = std.mem.trim(u8, first_line, " \t\r");
-
-        const recipient_z = try allocator.dupeZ(u8, recipient);
-        defer allocator.free(recipient_z);
-
-        try age_lib.encryptToFile(content, recipient_z, output_path_z);
-    }
+    // Pass directly to Rust - it handles both file paths and direct keys
+    // and supports x25519, SSH, and plugin recipients
+    try age_lib.encryptToFile(content, recipients_z, output_path_z);
 }
 
 /// Generate a new age keypair
