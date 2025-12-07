@@ -32,7 +32,7 @@ pub fn main() !void {
     // Get an allocator. GeneralPurposeAllocator is a good default.
     // In Python, you never think about this - memory just "works".
     // In Zig, you explicitly request memory and must free it.
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
     defer _ = gpa.deinit(); // `defer` runs when function exits (like Python's `finally`)
 
     const allocator = gpa.allocator();
