@@ -1,0 +1,4 @@
+[submodule "libs/zxing-cpp"]
+	path = libs/zxing-cpp
+	url = https://github.com/SecKatie/zxing-cpp.git
+	branch = zig-bindings
