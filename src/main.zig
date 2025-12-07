@@ -70,6 +70,7 @@ test {
     _ = @import("store.zig");
     _ = @import("age.zig");
     _ = @import("clipboard.zig");
+    _ = @import("utils.zig");
 }
 
 test "basic sanity check" {

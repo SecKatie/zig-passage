@@ -7,6 +7,7 @@ const posix = std.posix;
 const age = @import("age.zig");
 const cli = @import("cli.zig");
 const clipboard = @import("clipboard.zig");
+const utils = @import("utils.zig");
 const zxing = @import("zxing");
 
 const CLIP_TIME: u32 = 45; // seconds to clear clipboard
@@ -48,41 +49,9 @@ pub const Store = struct {
         QrCodeFailed,
     };
 
-    /// Securely wipe sensitive data from memory before freeing
-    /// Uses volatile write to prevent compiler optimization
-    pub fn secureWipe(slice: []u8) void {
-        @memset(slice, 0);
-        // Prevent compiler from optimizing away the memset
-        std.mem.doNotOptimizeAway(slice.ptr);
-    }
 
-    /// Securely free sensitive data (wipe then free)
-    pub fn secureFree(allocator: std.mem.Allocator, slice: []u8) void {
-        secureWipe(slice);
-        allocator.free(slice);
-    }
 
-    /// Check for sneaky path traversal attempts (../) and other malicious paths
-    fn checkSneakyPaths(path: []const u8) !void {
-        // Reject absolute paths - passwords must be relative to store
-        if (std.fs.path.isAbsolute(path)) {
-            return Error.SneakyPath;
-        }
 
-        // Reject embedded null bytes (could truncate path in C libraries)
-        if (mem.indexOfScalar(u8, path, 0) != null) {
-            return Error.SneakyPath;
-        }
-
-        // Check for various forms of path traversal
-        if (mem.startsWith(u8, path, "../") or
-            mem.endsWith(u8, path, "/..") or
-            mem.indexOf(u8, path, "/../") != null or
-            mem.eql(u8, path, ".."))
-        {
-            return Error.SneakyPath;
-        }
-    }
 
     /// Opens an existing password store or prepares for initialization
     pub fn open(allocator: std.mem.Allocator) !Self {
@@ -188,7 +157,7 @@ pub const Store = struct {
 
     /// Show/decrypt a password
     pub fn show(self: *Self, allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-        try checkSneakyPaths(name);
+        try utils.checkSneakyPaths(name);
 
         const path = try std.fmt.allocPrint(allocator, "{s}/{s}.age", .{ self.store_dir, name });
         defer allocator.free(path);
@@ -207,7 +176,7 @@ pub const Store = struct {
     /// Display password as QR code using native zxing-cpp bindings
     pub fn showQrCode(self: *Self, allocator: std.mem.Allocator, name: []const u8, line: ?u32) !void {
         const content = try self.show(allocator, name);
-        defer secureFree(allocator, @constCast(content));
+        defer utils.secureFree(allocator, @constCast(content));
 
         // Get the specific line (default to first line)
         const target_line = line orelse 1;
@@ -275,7 +244,7 @@ pub const Store = struct {
     /// Copy password to clipboard with timeout clearing
     pub fn copyToClipboard(self: *Self, allocator: std.mem.Allocator, name: []const u8, line: ?u32) !void {
         const content = try self.show(allocator, name);
-        defer secureFree(allocator, @constCast(content));
+        defer utils.secureFree(allocator, @constCast(content));
 
         // Get the specific line (default to first line)
         const target_line = line orelse 1;
@@ -306,7 +275,7 @@ pub const Store = struct {
 
     /// Insert a new password
     pub fn insert(self: *Self, opts: cli.Command.InsertOptions) !void {
-        try checkSneakyPaths(opts.name);
+        try utils.checkSneakyPaths(opts.name);
 
         const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.age", .{ self.store_dir, opts.name });
         defer self.allocator.free(path);
@@ -427,7 +396,7 @@ pub const Store = struct {
 
     /// Generate a new password
     pub fn generate(self: *Self, allocator: std.mem.Allocator, opts: cli.Command.GenerateOptions) !void {
-        try checkSneakyPaths(opts.name);
+        try utils.checkSneakyPaths(opts.name);
 
         var stdout_buf: [1024]u8 = undefined;
         var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
@@ -478,7 +447,7 @@ pub const Store = struct {
         var content: []const u8 = password;
         if (opts.in_place) {
             const existing = self.show(allocator, opts.name) catch password;
-            defer if (existing.ptr != password.ptr) secureFree(allocator, @constCast(existing));
+            defer if (existing.ptr != password.ptr) utils.secureFree(allocator, @constCast(existing));
 
             if (mem.indexOf(u8, existing, "\n")) |newline_idx| {
                 // Replace first line, keep the rest
@@ -513,7 +482,7 @@ pub const Store = struct {
 
     /// Edit a password in the user's editor
     pub fn edit(self: *Self, allocator: std.mem.Allocator, name: []const u8) !void {
-        try checkSneakyPaths(name);
+        try utils.checkSneakyPaths(name);
 
         const path = try std.fmt.allocPrint(allocator, "{s}/{s}.age", .{ self.store_dir, name });
         defer allocator.free(path);
@@ -522,7 +491,7 @@ pub const Store = struct {
         const editor = std.posix.getenv("EDITOR") orelse std.posix.getenv("VISUAL") orelse "vi";
 
         // Create secure temp file with unpredictable name
-        const secure_tmpdir = getSecureTmpDir();
+        const secure_tmpdir = utils.getSecureTmpDir();
 
         // Generate random suffix for unpredictable filename (prevents symlink attacks)
         var rand_suffix: [16]u8 = undefined;
@@ -542,7 +511,7 @@ pub const Store = struct {
         if (!is_new) {
             action = "Edit";
             const content = try self.show(allocator, name);
-            defer secureFree(allocator, @constCast(content));
+            defer utils.secureFree(allocator, @constCast(content));
 
             // Create with restrictive permissions (owner read/write only)
             const tmp_file = try fs.createFileAbsolute(tmp_path, .{ .mode = 0o600 });
@@ -587,14 +556,14 @@ pub const Store = struct {
         }
 
         const new_content = try allocator.alloc(u8, stat.size);
-        defer secureFree(allocator, new_content);
+        defer utils.secureFree(allocator, new_content);
         const bytes_read = try tmp_file.readAll(new_content);
         const content = new_content[0..bytes_read];
 
         // Check if content actually changed (for existing files)
         if (!is_new) {
             const old_content = self.show(allocator, name) catch "";
-            defer if (old_content.len > 0) secureFree(allocator, @constCast(old_content));
+            defer if (old_content.len > 0) utils.secureFree(allocator, @constCast(old_content));
 
             if (mem.eql(u8, content, old_content)) {
                 const stdout = std.fs.File.stdout();
@@ -618,24 +587,11 @@ pub const Store = struct {
         try self.gitCommit("{s} password for {s} using {s}", .{ action, name, editor });
     }
 
-    /// Get secure temp directory (prefer /dev/shm on Linux)
-    fn getSecureTmpDir() []const u8 {
-        switch (comptime builtin.os.tag) {
-            .linux => {
-                // Check if /dev/shm exists and is writable
-                if (fs.accessAbsolute("/dev/shm", .{ .mode = .read_write })) |_| {
-                    return "/dev/shm";
-                } else |_| {}
-            },
-            else => {},
-        }
-        // Fall back to TMPDIR or /tmp
-        return std.posix.getenv("TMPDIR") orelse "/tmp";
-    }
+
 
     /// Delete a password
     pub fn delete(self: *Self, opts: cli.Command.DeleteOptions) !void {
-        try checkSneakyPaths(opts.name);
+        try utils.checkSneakyPaths(opts.name);
 
         var stdout_buf: [1024]u8 = undefined;
         var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
@@ -751,7 +707,7 @@ pub const Store = struct {
 
                 // Decrypt and search
                 const content = age.decrypt(self.allocator, file_path, self.identities_file) catch continue;
-                defer secureFree(self.allocator, @constCast(content));
+                defer utils.secureFree(self.allocator, @constCast(content));
 
                 const name = full_name[0 .. full_name.len - 4];
 
@@ -770,11 +726,11 @@ pub const Store = struct {
 
     /// Copy a password (re-encrypts for destination recipients)
     pub fn copy(self: *Self, opts: cli.Command.CopyMoveOptions) !void {
-        try checkSneakyPaths(opts.source);
-        try checkSneakyPaths(opts.dest);
+        try utils.checkSneakyPaths(opts.source);
+        try utils.checkSneakyPaths(opts.dest);
 
         const content = try self.show(self.allocator, opts.source);
-        defer secureFree(self.allocator, @constCast(content));
+        defer utils.secureFree(self.allocator, @constCast(content));
 
         const dest_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.age", .{ self.store_dir, opts.dest });
         defer self.allocator.free(dest_path);
@@ -801,8 +757,8 @@ pub const Store = struct {
 
     /// Move/rename a password
     pub fn move(self: *Self, opts: cli.Command.CopyMoveOptions) !void {
-        try checkSneakyPaths(opts.source);
-        try checkSneakyPaths(opts.dest);
+        try utils.checkSneakyPaths(opts.source);
+        try utils.checkSneakyPaths(opts.dest);
 
         try self.copy(.{ .source = opts.source, .dest = opts.dest, .force = opts.force });
 
@@ -904,7 +860,7 @@ pub const Store = struct {
             } else if (mem.endsWith(u8, entry.name, ".age")) {
                 // Decrypt
                 const content = age.decrypt(self.allocator, full_path, self.identities_file) catch continue;
-                defer secureFree(self.allocator, @constCast(content));
+                defer utils.secureFree(self.allocator, @constCast(content));
 
                 // Get recipients for this path
                 const name = entry.name[0 .. entry.name.len - 4];
@@ -997,41 +953,7 @@ pub const Store = struct {
 // TESTS
 // =============================================================================
 
-test "checkSneakyPaths detects path traversal" {
-    // Path traversal attempts should fail
-    try std.testing.expectError(Store.Error.SneakyPath, Store.checkSneakyPaths("../etc/passwd"));
-    try std.testing.expectError(Store.Error.SneakyPath, Store.checkSneakyPaths("foo/../bar"));
-    try std.testing.expectError(Store.Error.SneakyPath, Store.checkSneakyPaths("foo/.."));
-    try std.testing.expectError(Store.Error.SneakyPath, Store.checkSneakyPaths(".."));
 
-    // Absolute paths should fail
-    try std.testing.expectError(Store.Error.SneakyPath, Store.checkSneakyPaths("/etc/passwd"));
-    try std.testing.expectError(Store.Error.SneakyPath, Store.checkSneakyPaths("/tmp/secret"));
-
-    // Null byte injection should fail
-    try std.testing.expectError(Store.Error.SneakyPath, Store.checkSneakyPaths("foo\x00bar"));
-    try std.testing.expectError(Store.Error.SneakyPath, Store.checkSneakyPaths("password\x00/../etc/passwd"));
-
-    // These should pass (legitimate password names)
-    try Store.checkSneakyPaths("foo/bar");
-    try Store.checkSneakyPaths("foo.bar");
-    try Store.checkSneakyPaths("foo..bar");
-    try Store.checkSneakyPaths("..foo");
-    try Store.checkSneakyPaths("foo..");
-    try Store.checkSneakyPaths("email/work");
-    try Store.checkSneakyPaths("sites/github.com");
-}
-
-test "getSecureTmpDir returns valid directory" {
-    const tmpdir = Store.getSecureTmpDir();
-    try std.testing.expect(tmpdir.len > 0);
-
-    // Should be accessible
-    fs.accessAbsolute(tmpdir, .{}) catch {
-        // If we can't access it, the test should fail
-        try std.testing.expect(false);
-    };
-}
 
 // Integration tests require age to be installed and can be run separately
 test "store open and deinit" {

@@ -1,6 +1,7 @@
 const std = @import("std");
 const clap = @import("clap");
 const Store = @import("store.zig").Store;
+const utils = @import("utils.zig");
 
 // =============================================================================
 // COMMAND LINE INTERFACE - Using zig-clap
@@ -287,7 +288,7 @@ fn handleShow(allocator: std.mem.Allocator, iter: *std.process.ArgIterator) !voi
     }
 
     const password = try store.show(allocator, opts.name);
-    defer Store.secureFree(allocator, @constCast(password));
+    defer utils.secureFree(allocator, @constCast(password));
 
     const stdout_file = std.fs.File.stdout();
     var stdout_buf: [4096]u8 = undefined;
