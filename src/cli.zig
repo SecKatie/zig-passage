@@ -47,9 +47,10 @@ pub const Command = union(enum) {
 
     pub const GenerateOptions = struct {
         name: []const u8,
-        length: u32 = 25,
+        length: ?u32 = null,
         no_symbols: bool = false,
         clip: bool = false,
+        qrcode: bool = false,
         in_place: bool = false,
         force: bool = false,
     };
@@ -379,6 +380,7 @@ fn handleGenerate(allocator: std.mem.Allocator, iter: *std.process.ArgIterator) 
         \\-h, --help       Display this help and exit.
         \\-n, --no-symbols Do not use special symbols in password.
         \\-c, --clip       Copy to clipboard instead of printing.
+        \\-q, --qrcode     Display password as QR code.
         \\-i, --in-place   Replace only the first line of existing password.
         \\-f, --force      Overwrite existing password without confirmation.
         \\<str>...
@@ -410,6 +412,7 @@ fn handleGenerate(allocator: std.mem.Allocator, iter: *std.process.ArgIterator) 
             \\  -h, --help       Display this help and exit.
             \\  -n, --no-symbols Do not use special symbols in password.
             \\  -c, --clip       Copy to clipboard instead of printing.
+            \\  -q, --qrcode     Display password as QR code.
             \\  -i, --in-place   Replace only the first line of existing password.
             \\  -f, --force      Overwrite existing password without confirmation.
             \\
@@ -420,29 +423,20 @@ fn handleGenerate(allocator: std.mem.Allocator, iter: *std.process.ArgIterator) 
 
     // Parse positionals: can be [name] or [length, name]
     var name: ?[]const u8 = null;
-    var length: u32 = 25;
+    var length: ?u32 = null;
 
     if (res.positionals[0].len == 0) return error.MissingArgument;
 
     if (res.positionals[0].len == 1) {
-        const arg = res.positionals[0][0];
-        // Try to parse as length, otherwise it's the name
-        if (std.fmt.parseInt(u32, arg, 10)) |len| {
-            length = len;
-            // Length only, need name from next arg - but we don't have it
-            // So this must be the name
-            name = arg;
-        } else |_| {
-            name = arg;
-        }
+        // Single argument is always the password name
+        // Usage: passage generate pass-name [pass-length]
+        name = res.positionals[0][0];
     } else if (res.positionals[0].len >= 2) {
-        // First might be length, second is name
-        if (std.fmt.parseInt(u32, res.positionals[0][0], 10)) |len| {
+        // Two arguments: name and optional length
+        // Usage: passage generate pass-name pass-length
+        name = res.positionals[0][0];
+        if (std.fmt.parseInt(u32, res.positionals[0][1], 10) catch null) |len| {
             length = len;
-            name = res.positionals[0][1];
-        } else |_| {
-            // Both are names? Take the first one
-            name = res.positionals[0][0];
         }
     }
 
@@ -453,6 +447,7 @@ fn handleGenerate(allocator: std.mem.Allocator, iter: *std.process.ArgIterator) 
         .length = length,
         .no_symbols = res.args.@"no-symbols" != 0,
         .clip = res.args.clip != 0,
+        .qrcode = res.args.qrcode != 0,
         .in_place = res.args.@"in-place" != 0,
         .force = res.args.force != 0,
     };
@@ -734,7 +729,7 @@ fn handleInit(allocator: std.mem.Allocator) !void {
 fn handleReencrypt(allocator: std.mem.Allocator, iter: *std.process.ArgIterator) !void {
     const params = comptime clap.parseParamsComptime(
         \\-h, --help    Display this help and exit.
-        \\    --path <str> Path to re-encrypt.
+        \\-p, --path <str> Path to re-encrypt.
         \\
     );
 
@@ -761,7 +756,7 @@ fn handleReencrypt(allocator: std.mem.Allocator, iter: *std.process.ArgIterator)
             \\
             \\Options:
             \\  -h, --help       Display this help and exit.
-            \\      --path <dir> Path to re-encrypt.
+            \\  -p, --path <dir> Path to re-encrypt.
             \\
         );
         try stdout.flush();

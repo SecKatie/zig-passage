@@ -10,7 +10,8 @@ const clipboard = @import("clipboard.zig");
 const utils = @import("utils.zig");
 const zxing = @import("zxing");
 
-const CLIP_TIME: u32 = 45; // seconds to clear clipboard
+const DEFAULT_CLIP_TIME: u32 = 45; // seconds to clear clipboard
+const DEFAULT_GENERATED_LENGTH: u32 = 25;
 
 // =============================================================================
 // PASSWORD STORE
@@ -48,6 +49,28 @@ pub const Store = struct {
         SneakyPath,
         QrCodeFailed,
     };
+
+    /// Get the clipboard timeout from environment variable or use default
+    fn getClipTime() u32 {
+        if (std.posix.getenv("PASSWORD_STORE_CLIP_TIME")) |env_time| {
+            if (std.fmt.parseInt(u32, env_time, 10) catch null) |t| {
+                return t;
+            }
+        }
+        return DEFAULT_CLIP_TIME;
+    }
+
+    /// Construct the path to a password file
+    fn getPasswordPath(self: *Self, allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+        return try std.fmt.allocPrint(allocator, "{s}/{s}.age", .{ self.store_dir, name });
+    }
+
+    /// Encrypt content and save to path using recipients for the given name
+    fn encryptAndSave(self: *Self, allocator: std.mem.Allocator, content: []const u8, path: []const u8, name: []const u8) !void {
+        const recipients = try self.getRecipients(name);
+        defer self.allocator.free(recipients);
+        try age.encrypt(allocator, content, path, recipients);
+    }
 
     /// Opens an existing password store or prepares for initialization
     pub fn open(allocator: std.mem.Allocator) !Self {
@@ -155,7 +178,7 @@ pub const Store = struct {
     pub fn show(self: *Self, allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
         try utils.checkSneakyPaths(name);
 
-        const path = try std.fmt.allocPrint(allocator, "{s}/{s}.age", .{ self.store_dir, name });
+        const path = try self.getPasswordPath(allocator, name);
         defer allocator.free(path);
 
         // Check if file exists
@@ -174,24 +197,16 @@ pub const Store = struct {
         const content = try self.show(allocator, name);
         defer utils.secureFree(allocator, @constCast(content));
 
-        // Get the specific line (default to first line)
-        const target_line = line orelse 1;
-        var lines = mem.splitSequence(u8, content, "\n");
-        var current: u32 = 1;
-        var text: []const u8 = content;
-
-        while (lines.next()) |l| {
-            if (current == target_line) {
-                text = l;
-                break;
-            }
-            current += 1;
-        }
-
+        const text = utils.extractLine(content, line);
         if (text.len == 0) {
             return Error.PasswordNotFound;
         }
 
+        try self.printQrCode(text);
+    }
+
+    fn printQrCode(self: *Self, text: []const u8) !void {
+        _ = self;
         // Create QR code using native zxing library
         var creator = zxing.create(.qr_code) catch return Error.QrCodeFailed;
         defer creator.deinit();
@@ -242,30 +257,16 @@ pub const Store = struct {
         const content = try self.show(allocator, name);
         defer utils.secureFree(allocator, @constCast(content));
 
-        // Get the specific line (default to first line)
-        const target_line = line orelse 1;
-        var lines = mem.splitSequence(u8, content, "\n");
-        var current: u32 = 1;
-        var text: ?[]const u8 = null;
+        const text = utils.extractLine(content, line);
+        const clip_time = getClipTime();
 
-        while (lines.next()) |l| {
-            if (current == target_line) {
-                text = l;
-                break;
-            }
-            current += 1;
-        }
-
-        // If we didn't find the target line, use first line
-        const final_text = text orelse (if (mem.indexOf(u8, content, "\n")) |idx| content[0..idx] else content);
-
-        try clipboard.copy(final_text);
-        clipboard.clearAfterTimeout(CLIP_TIME) catch {};
+        try clipboard.copy(text);
+        clipboard.clearAfterTimeout(clip_time) catch {};
 
         var stdout_buf: [256]u8 = undefined;
         var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
         const stdout = &stdout_writer.interface;
-        try stdout.print("Copied {s} to clipboard. Will clear in {d} seconds.\n", .{ name, CLIP_TIME });
+        try stdout.print("Copied {s} to clipboard. Will clear in {d} seconds.\n", .{ name, clip_time });
         try stdout.flush();
     }
 
@@ -273,7 +274,7 @@ pub const Store = struct {
     pub fn insert(self: *Self, opts: cli.Command.InsertOptions) !void {
         try utils.checkSneakyPaths(opts.name);
 
-        const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.age", .{ self.store_dir, opts.name });
+        const path = try self.getPasswordPath(self.allocator, opts.name);
         defer self.allocator.free(path);
 
         // Check if exists (only error if file exists and force is not set)
@@ -306,9 +307,9 @@ pub const Store = struct {
 
             // Disable echo for password entry (unless -e flag)
             if (!opts.echo) {
-                disableEcho();
+                utils.disableEcho();
             }
-            defer if (!opts.echo) enableEcho();
+            defer if (!opts.echo) utils.enableEcho();
 
             var read_buf: [4096]u8 = undefined;
             var f_reader = stdin.reader(&read_buf);
@@ -338,56 +339,13 @@ pub const Store = struct {
         }
 
         // Create parent directories if needed
-        if (std.fs.path.dirname(path)) |parent| {
-            fs.makeDirAbsolute(parent) catch |err| {
-                if (err != error.PathAlreadyExists) return err;
-            };
-        }
+        try utils.ensureParentDir(path);
 
         // Encrypt and save
-        const recipients = try self.getRecipients(opts.name);
-        defer self.allocator.free(recipients);
-        try age.encrypt(self.allocator, password, path, recipients);
+        try self.encryptAndSave(self.allocator, password, path, opts.name);
 
         try stdout.writeAll("\n");
         try self.gitCommit("Add password for {s}", .{opts.name});
-    }
-
-    // Saved terminal state for restoration
-    var saved_termios: ?std.posix.termios = null;
-
-    /// Disable terminal echo for password entry
-    /// Saves original terminal state so it can be restored
-    fn disableEcho() void {
-        switch (comptime builtin.os.tag) {
-            .linux, .macos, .freebsd, .openbsd, .netbsd => {
-                // Save original terminal state for restoration
-                saved_termios = std.posix.tcgetattr(std.posix.STDIN_FILENO) catch return;
-
-                var termios = saved_termios.?;
-                termios.lflag.ECHO = false;
-                std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, termios) catch {};
-            },
-            else => {},
-        }
-    }
-
-    /// Re-enable terminal echo by restoring saved state
-    fn enableEcho() void {
-        switch (comptime builtin.os.tag) {
-            .linux, .macos, .freebsd, .openbsd, .netbsd => {
-                // Restore saved state if available, otherwise just enable echo
-                if (saved_termios) |termios| {
-                    std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, termios) catch {};
-                    saved_termios = null;
-                } else {
-                    var termios = std.posix.tcgetattr(std.posix.STDIN_FILENO) catch return;
-                    termios.lflag.ECHO = true;
-                    std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, termios) catch {};
-                }
-            },
-            else => {},
-        }
     }
 
     /// Generate a new password
@@ -398,25 +356,40 @@ pub const Store = struct {
         var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
         const stdout = &stdout_writer.interface;
 
+        // Determine length
+        var length: u32 = DEFAULT_GENERATED_LENGTH;
+        if (opts.length) |l| {
+            length = l;
+        } else if (std.posix.getenv("PASSWORD_STORE_GENERATED_LENGTH")) |env_len| {
+            if (std.fmt.parseInt(u32, env_len, 10) catch null) |l| {
+                length = l;
+            }
+        }
+
+        // Determine clip time from environment variable
+        const clip_time = getClipTime();
+
+        // Determine charset
+        const default_charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+[]{}|;:,.<>?";
+        const default_charset_no_sym = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+        var charset: []const u8 = undefined;
+        if (opts.no_symbols) {
+            charset = if (std.posix.getenv("PASSWORD_STORE_CHARACTER_SET_NO_SYMBOLS")) |s| std.mem.sliceTo(s, 0) else default_charset_no_sym;
+        } else {
+            charset = if (std.posix.getenv("PASSWORD_STORE_CHARACTER_SET")) |s| std.mem.sliceTo(s, 0) else default_charset;
+        }
+
         // Generate random password
         var password_buf: [256]u8 = undefined;
-        const length = @min(opts.length, password_buf.len);
-
-        const charset = if (opts.no_symbols)
-            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-        else
-            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+[]{}|;:,.<>?";
+        const final_length = @min(length, password_buf.len);
 
         // Use crypto-secure random with rejection sampling to avoid modulo bias
-        // Modulo bias occurs because 256 doesn't divide evenly by charset.len
-        // Calculate the largest multiple of charset.len that fits in 0-255
         const charset_len: u9 = @intCast(charset.len);
         const remainder: u9 = 256 % charset_len;
-        // If remainder is 0, all values are unbiased; otherwise reject values >= (256 - remainder)
         const max_valid: u8 = if (remainder == 0) 255 else @intCast(256 - remainder - 1);
 
-        for (password_buf[0..length]) |*byte| {
-            // Rejection sampling: discard values that would cause bias
+        for (password_buf[0..final_length]) |*byte| {
             while (true) {
                 var rand: [1]u8 = undefined;
                 std.crypto.random.bytes(&rand);
@@ -424,12 +397,11 @@ pub const Store = struct {
                     byte.* = charset[rand[0] % @as(u8, @intCast(charset.len))];
                     break;
                 }
-                // Value would cause bias, try again (very rare, ~3% for 62 chars, ~0.4% for 95 chars)
             }
         }
-        const password = password_buf[0..length];
+        const password = password_buf[0..final_length];
 
-        const path = try std.fmt.allocPrint(allocator, "{s}/{s}.age", .{ self.store_dir, opts.name });
+        const path = try self.getPasswordPath(allocator, opts.name);
         defer allocator.free(path);
 
         // Check if exists (unless force or in_place)
@@ -454,24 +426,21 @@ pub const Store = struct {
         }
 
         // Create parent directories
-        if (std.fs.path.dirname(path)) |parent| {
-            fs.makeDirAbsolute(parent) catch |err| {
-                if (err != error.PathAlreadyExists) return err;
-            };
-        }
+        try utils.ensureParentDir(path);
 
         // Encrypt and save
-        const recipients = try self.getRecipients(opts.name);
-        defer self.allocator.free(recipients);
-        try age.encrypt(allocator, content, path, recipients);
+        try self.encryptAndSave(allocator, content, path, opts.name);
 
         if (opts.clip) {
             try clipboard.copy(password);
-            clipboard.clearAfterTimeout(CLIP_TIME) catch {};
-            try stdout.print("Generated password for {s} and copied to clipboard. Will clear in {d} seconds.\n", .{ opts.name, CLIP_TIME });
+            clipboard.clearAfterTimeout(clip_time) catch {};
+            try stdout.print("Generated password for {s} and copied to clipboard. Will clear in {d} seconds.\n", .{ opts.name, clip_time });
+        } else if (opts.qrcode) {
+            try self.printQrCode(password);
         } else {
             try stdout.print("Generated password for {s}:\n{s}\n", .{ opts.name, password });
         }
+        try stdout.flush();
 
         try self.gitCommit("Generate password for {s}", .{opts.name});
     }
@@ -480,7 +449,7 @@ pub const Store = struct {
     pub fn edit(self: *Self, allocator: std.mem.Allocator, name: []const u8) !void {
         try utils.checkSneakyPaths(name);
 
-        const path = try std.fmt.allocPrint(allocator, "{s}/{s}.age", .{ self.store_dir, name });
+        const path = try self.getPasswordPath(allocator, name);
         defer allocator.free(path);
 
         // Get editor
@@ -569,16 +538,10 @@ pub const Store = struct {
         }
 
         // Create parent directories if needed (for new files)
-        if (std.fs.path.dirname(path)) |parent| {
-            fs.makeDirAbsolute(parent) catch |err| {
-                if (err != error.PathAlreadyExists) return err;
-            };
-        }
+        try utils.ensureParentDir(path);
 
         // Encrypt and save
-        const recipients = try self.getRecipients(name);
-        defer self.allocator.free(recipients);
-        try age.encrypt(allocator, content, path, recipients);
+        try self.encryptAndSave(allocator, content, path, name);
 
         try self.gitCommit("{s} password for {s} using {s}", .{ action, name, editor });
     }
@@ -590,8 +553,31 @@ pub const Store = struct {
         var stdout_buf: [1024]u8 = undefined;
         var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
         const stdout = &stdout_writer.interface;
-        const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.age", .{ self.store_dir, opts.name });
+        const path = try self.getPasswordPath(self.allocator, opts.name);
         defer self.allocator.free(path);
+
+        const dir_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.store_dir, opts.name });
+        defer self.allocator.free(dir_path);
+
+        // Check what we're dealing with: file, directory, or neither
+        const file_exists = if (fs.accessAbsolute(path, .{})) |_| true else |_| false;
+        const dir_exists = if (fs.accessAbsolute(dir_path, .{})) |_| blk: {
+            // Verify it's actually a directory
+            var dir = fs.openDirAbsolute(dir_path, .{}) catch break :blk false;
+            dir.close();
+            break :blk true;
+        } else |_| false;
+
+        if (!file_exists and !dir_exists) {
+            return Error.PasswordNotFound;
+        }
+
+        // If it's a directory but -r wasn't specified, error out
+        if (dir_exists and !file_exists and !opts.recursive) {
+            try stdout.print("Error: {s} is a directory. Use -r to delete recursively.\n", .{opts.name});
+            try stdout.flush();
+            return;
+        }
 
         if (!opts.force) {
             try stdout.print("Are you sure you want to delete {s}? [y/N] ", .{opts.name});
@@ -605,10 +591,7 @@ pub const Store = struct {
             }
         }
 
-        if (opts.recursive) {
-            const dir_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.store_dir, opts.name });
-            defer self.allocator.free(dir_path);
-
+        if (opts.recursive or dir_exists) {
             fs.deleteTreeAbsolute(dir_path) catch |err| {
                 if (err == error.FileNotFound) return Error.PasswordNotFound;
                 return err;
@@ -621,6 +604,7 @@ pub const Store = struct {
         }
 
         try stdout.print("Removed {s}\n", .{opts.name});
+        try stdout.flush();
         try self.gitCommit("Remove password for {s}", .{opts.name});
     }
 
@@ -726,7 +710,7 @@ pub const Store = struct {
         const content = try self.show(self.allocator, opts.source);
         defer utils.secureFree(self.allocator, @constCast(content));
 
-        const dest_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.age", .{ self.store_dir, opts.dest });
+        const dest_path = try self.getPasswordPath(self.allocator, opts.dest);
         defer self.allocator.free(dest_path);
 
         if (!opts.force) {
@@ -736,15 +720,10 @@ pub const Store = struct {
         }
 
         // Create parent directories
-        if (std.fs.path.dirname(dest_path)) |parent| {
-            fs.makeDirAbsolute(parent) catch |err| {
-                if (err != error.PathAlreadyExists) return err;
-            };
-        }
+        try utils.ensureParentDir(dest_path);
 
-        const recipients = try self.getRecipients(opts.dest);
-        defer self.allocator.free(recipients);
-        try age.encrypt(self.allocator, content, dest_path, recipients);
+        // Encrypt and save
+        try self.encryptAndSave(self.allocator, content, dest_path, opts.dest);
 
         try self.gitCommit("Copy {s} to {s}", .{ opts.source, opts.dest });
     }
@@ -756,7 +735,7 @@ pub const Store = struct {
 
         try self.copy(.{ .source = opts.source, .dest = opts.dest, .force = opts.force });
 
-        const src_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.age", .{ self.store_dir, opts.source });
+        const src_path = try self.getPasswordPath(self.allocator, opts.source);
         defer self.allocator.free(src_path);
 
         try fs.deleteFileAbsolute(src_path);

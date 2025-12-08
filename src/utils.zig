@@ -58,6 +58,69 @@ pub fn getSecureTmpDir() []const u8 {
     return std.posix.getenv("TMPDIR") orelse "/tmp";
 }
 
+/// Ensure parent directories exist for the given path
+pub fn ensureParentDir(path: []const u8) !void {
+    if (std.fs.path.dirname(path)) |parent| {
+        fs.makeDirAbsolute(parent) catch |err| {
+            if (err != error.PathAlreadyExists) return err;
+        };
+    }
+}
+
+/// Extract a specific line from content (default to first line)
+pub fn extractLine(content: []const u8, line: ?u32) []const u8 {
+    const target_line = line orelse 1;
+    var lines = mem.splitSequence(u8, content, "\n");
+    var current: u32 = 1;
+
+    while (lines.next()) |l| {
+        if (current == target_line) {
+            return l;
+        }
+        current += 1;
+    }
+
+    // Default to first line if not found
+    return if (mem.indexOf(u8, content, "\n")) |idx| content[0..idx] else content;
+}
+
+// Saved terminal state for restoration
+var saved_termios: ?std.posix.termios = null;
+
+/// Disable terminal echo for password entry
+/// Saves original terminal state so it can be restored
+pub fn disableEcho() void {
+    switch (comptime builtin.os.tag) {
+        .linux, .macos, .freebsd, .openbsd, .netbsd => {
+            // Save original terminal state for restoration
+            saved_termios = std.posix.tcgetattr(std.posix.STDIN_FILENO) catch return;
+
+            var termios = saved_termios.?;
+            termios.lflag.ECHO = false;
+            std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, termios) catch {};
+        },
+        else => {},
+    }
+}
+
+/// Re-enable terminal echo by restoring saved state
+pub fn enableEcho() void {
+    switch (comptime builtin.os.tag) {
+        .linux, .macos, .freebsd, .openbsd, .netbsd => {
+            // Restore saved state if available, otherwise just enable echo
+            if (saved_termios) |termios| {
+                std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, termios) catch {};
+                saved_termios = null;
+            } else {
+                var termios = std.posix.tcgetattr(std.posix.STDIN_FILENO) catch return;
+                termios.lflag.ECHO = true;
+                std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, termios) catch {};
+            }
+        },
+        else => {},
+    }
+}
+
 // =============================================================================
 // TESTS
 // =============================================================================
